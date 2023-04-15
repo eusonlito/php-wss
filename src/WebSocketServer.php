@@ -87,6 +87,8 @@ class WebSocketServer extends WssMain implements WebSocketServerContract
     public function loopingDelay(int $loopingDelay): self
     {
         $this->loopingDelay = $loopingDelay;
+
+        return $this;
     }
 
     /**
