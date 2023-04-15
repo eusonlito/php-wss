@@ -57,6 +57,11 @@ class WebSocketServer extends WssMain implements WebSocketServerContract
     private int $loopingDelay = 1000;
 
     /**
+     * @var bool
+     */
+    private bool $printException = true;
+
+    /**
      * WebSocketServer constructor.
      *
      * @param WebSocket $handler
@@ -75,13 +80,23 @@ class WebSocketServer extends WssMain implements WebSocketServerContract
     }
 
     /**
-     * Set the looping sleep in microseconds
+     * Set the looping delay in microseconds
      *
      * @return self
      */
     public function loopingDelay(int $loopingDelay): self
     {
         $this->loopingDelay = $loopingDelay;
+    }
+
+    /**
+     * Configure if error exceptions should be printed
+     *
+     * @return self
+     */
+    public function printException(bool $printException): self
+    {
+        $this->printException = $printException;
 
         return $this;
     }
@@ -252,38 +267,41 @@ class WebSocketServer extends WssMain implements WebSocketServerContract
     {
         foreach ($readSocks as $kSock => $sock) {
             $data = $this->decode(fread($sock, self::MAX_BYTES_READ));
-            if ($data !== null) {
-                $dataType = null;
-                $dataPayload = null;
-                if ($data !== false) { // payload is too large - waiting for remained data
-                    $dataType = $data['type'];
-                    $dataPayload = $data['payload'];
+
+            if ($data === null) {
+                continue;
+            }
+
+            $dataType = null;
+            $dataPayload = null;
+            if ($data !== false) { // payload is too large - waiting for remained data
+                $dataType = $data['type'];
+                $dataPayload = $data['payload'];
+            }
+
+            // to manipulate connection through send/close methods via handler, specified in IConnection
+            $cureentConn = new Connection($sock, $this->clients);
+            if (empty($data) || $dataType === self::EVENT_TYPE_CLOSE) { // close event triggered from client - browser tab or close socket event
+                // trigger CLOSE event
+                try {
+                    $this->handler->onClose($cureentConn);
+                } catch (WebSocketException $e) {
+                    $this->handleMessagesWorkerException($cureentConn, $e);
                 }
 
-                // to manipulate connection through send/close methods via handler, specified in IConnection
-                $cureentConn = new Connection($sock, $this->clients);
-                if (empty($data) || $dataType === self::EVENT_TYPE_CLOSE) { // close event triggered from client - browser tab or close socket event
-                    // trigger CLOSE event
-                    try {
-                        $this->handler->onClose($cureentConn);
-                    } catch (WebSocketException $e) {
-                        $e->printStack();
-                    }
+                // to avoid event leaks
+                unset($this->clients[array_search($sock, $this->clients)], $readSocks[$kSock]);
+                continue;
+            }
 
-                    // to avoid event leaks
-                    unset($this->clients[array_search($sock, $this->clients)], $readSocks[$kSock]);
-                    continue;
-                }
-
-                $isSupportedMethod = empty(self::MAP_EVENT_TYPE_TO_METHODS[$dataType]) === false
-                    && method_exists($this->handler, self::MAP_EVENT_TYPE_TO_METHODS[$dataType]);
-                if ($isSupportedMethod) {
-                    try {
-                        // dynamic call: onMessage, onPing, onPong
-                        $this->handler->{self::MAP_EVENT_TYPE_TO_METHODS[$dataType]}($cureentConn, $dataPayload);
-                    } catch (WebSocketException $e) {
-                        $e->printStack();
-                    }
+            $isSupportedMethod = empty(self::MAP_EVENT_TYPE_TO_METHODS[$dataType]) === false
+                && method_exists($this->handler, self::MAP_EVENT_TYPE_TO_METHODS[$dataType]);
+            if ($isSupportedMethod) {
+                try {
+                    // dynamic call: onMessage, onPing, onPong
+                    $this->handler->{self::MAP_EVENT_TYPE_TO_METHODS[$dataType]}($cureentConn, $dataPayload);
+                } catch (WebSocketException $e) {
+                    $this->handleMessagesWorkerException($cureentConn, $e);
                 }
             }
         }
@@ -299,7 +317,6 @@ class WebSocketServer extends WssMain implements WebSocketServerContract
      */
     private function handshake($client, string $headers): string
     {
-        $match = [];
         preg_match(self::SEC_WEBSOCKET_KEY_PTRN, $headers, $match);
         if (empty($match[1])) {
             return '';
@@ -362,25 +379,41 @@ class WebSocketServer extends WssMain implements WebSocketServerContract
      */
     private function setPathParams(string $headers): void
     {
-        if (empty($this->handler->pathParams) === false) {
-            $matches = [];
-            preg_match('/GET\s(.*?)\s/', $headers, $matches);
-            $left = $matches[1];
+        if (empty($this->handler->pathParams)) {
+            return;
+        }
 
-            foreach ($this->handler->pathParams as $k => $param) {
-                if (empty($this->handler->pathParams[$k + 1]) && strpos($left, '/', 1) === false) {
-                    // do not eat last char if there is no / at the end
-                    $this->handler->pathParams[$param] = substr($left, strpos($left, '/') + 1);
-                } else {
-                    // eat both slashes
-                    $this->handler->pathParams[$param] = substr($left, strpos($left, '/') + 1,
-                        strpos($left, '/', 1) - 1);
-                }
+        preg_match('/GET\s(.*?)\s/', $headers, $matches);
+        $left = $matches[1];
 
-                // clear the declaration of parsed param
-                unset($this->handler->pathParams[array_search($param, $this->handler->pathParams, false)]);
-                $left = substr($left, strpos($left, '/', 1));
+        foreach ($this->handler->pathParams as $k => $param) {
+            if (empty($this->handler->pathParams[$k + 1]) && strpos($left, '/', 1) === false) {
+                // do not eat last char if there is no / at the end
+                $this->handler->pathParams[$param] = substr($left, strpos($left, '/') + 1);
+            } else {
+                // eat both slashes
+                $this->handler->pathParams[$param] = substr($left, strpos($left, '/') + 1,
+                    strpos($left, '/', 1) - 1);
             }
+
+            // clear the declaration of parsed param
+            unset($this->handler->pathParams[array_search($param, $this->handler->pathParams, false)]);
+            $left = substr($left, strpos($left, '/', 1));
+        }
+    }
+
+    /**
+     * Manage messagesWorker Exceptions
+     *
+     * @param Connection $connection
+     * @param WebSocketException $e
+     */
+    private function handleMessagesWorkerException(Connection $connection, WebSocketException $e): void
+    {
+        $this->handler->onError($connection, $e);
+
+        if ($this->printException) {
+            $e->printStack();
         }
     }
 }
